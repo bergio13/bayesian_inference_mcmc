@@ -1,0 +1,934 @@
+---
+title: "Bayesian Analysis of Google Trends"
+author: "Bertone Giorgio"
+date: "2024-07-15"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(forecast)
+library(tseries)
+library(R2jags)
+library(lattice)
+library(LaplacesDemon)
+library(bayesplot)
+library(ggplot2)
+library(coda)
+library(ggmcmc)
+library(zoo)
+
+```
+
+## Introduction
+
+Google Trends data provides real-time insights into what people are searching for online. Google Trends has already been used effectively in public health sectors. For example, predicting trends in flu-related searches has helped health organizations anticipate outbreaks.
+
+Predicting Google searches for the "Vehicles and Cars" category could offer valuable insights into consumer behavior, market trends, and broader economic conditions. Cars are considered durable goods, significant investments that consumers typically make when they are confident in their economic stability. Their demand is quite elastic in the short run. High interest in purchasing vehicles can indicate that consumers feel financially secure, reflecting broader economic health. On the other hand,reduced interest in purchasing high-value items like cars can be an early indicator of an economic slowdown or recession.
+
+## Dataset
+
+We start by loading the file containing the weekly search interest for vehicles for the last 5 years (from 2019/07/07 to 2024/06/30). This data was obtained downloaded directly from the Google Trends website, selecting as country the United States and as category "Cars and vehicles".
+
+```{r data}
+data <- read.csv("veicoli.csv", header = TRUE)
+data$Week <- as.Date(data$Week, format = "%Y-%m-%d")
+dim(data)
+head(data)
+```
+
+```{r plot 1, echo=FALSE}
+start_time <- c(as.numeric(format(data$Week[1], "%Y")), as.numeric(format(data$Week[1], "%U")) + 1)
+data_ts <- ts(data$Interest, start = start_time, frequency = 52)
+
+plot(data_ts, main = "Interest in Vehicles Over Time", xlab = "Time", ylab = "Interest")
+points(data_ts, col = "red", pch = 16,cex =0.6 )
+
+# Add grid
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted")
+```
+
+Looking at this plot it seems like a good idea to use a model that takes into account past values to predict future ones, i.e. an autoregressive model. We now need to establish whether our time series is stationary, as AR models assume that the time series is stationary, which means that its statistical properties do not change over time. In particular:
+
+-   the mean of the series should not be a function of time, which means that the mean should be roughly constant though some variance can be modeled;
+
+-   the variance of the series should not be a function of time (homoskedasticity);
+
+-   the autocovariance of the terms should not be a function of time but only of the lag.
+
+We will conduct the Augmented Dickey-Fuller test (ADF), a type of statistical test called a unit root test, which is conducted with the following assumptions:
+
+-   The null hypothesis for the test is that the series is non-stationary, or series has a unit root.
+
+-   The alternative hypothesis for the test is that the series is stationary, or series has no unit root. If the null hypothesis cannot be rejected then this test might provide evidence that the series is non-stationary.
+
+```{r test, warning=FALSE}
+print(adf.test(data_ts))
+```
+
+The ADF tells us that the series is non-stationary, which means we will have to transform it before passing it to our autoregressive model.
+
+We'll use the decompose method to determine what may need to be removed from the time series in order to fix it.
+
+```{r code seas}
+decomp <- decompose(data_ts)
+plot(decomp)
+```
+
+This plot shows that our time series has a downward trend, as well as a constant seasonal component. Moreover, the time series shows heteroskedasticity, while autoregressive models assume homoskedasticity of the data. To manage it we can:
+
+-   take a Box-Cox transformation, a family of power transformations aimed at stabilizing variance and making the data more closely approximate a normal distribution
+
+-   remove the seasonal component
+
+-   remove the trend
+
+```{r box}
+data_ts <- data_ts - decomp$seasonal - na.approx(decomp$trend, rule = 2)
+
+lambda <-forecast::BoxCox.lambda(data_ts)
+y <- forecast::BoxCox(data_ts, lambda)
+
+print(adf.test(y))
+
+plot(y, main = "Transformed data", type = 'l')
+```
+
+There is now less evidence for non-stationarity now and we can reject the null hypothesis of the ADF test.
+
+Now, we need to check to see where our de-trended time series contains autocorrelations. We can see the degree to which a time series is correlated with its past values by calculating the autocorrelation. We will also check the partial autocorrelation, which controls for the autocorrelation at all other lags and is helpful in determining the order of the AR.
+
+```{r autocorr}
+par(mfrow = c(1, 2))
+
+acf(y)
+pacf(y)
+```
+
+The transformed series still shows a strongly positive correlations throughout the series. We can see also that the values of the PACF plot drop off quickly after the second lag.
+
+## Inferential Goals
+
+Before talking about the model, we want to specify the inferential goals of our analysis.
+
+1.  Parameter Estimation: estimate the posterior distributions of the model parameters and summarize these distributions using posterior means, medians, and credible intervals.
+
+2.  Hypothesis Testing: test specific hypotheses about the parameters by examining their posterior distributions.
+
+3.  Model Checking and Validation: simulate data from the posterior predictive distribution and compare it with the observed data to check if the model can reproduce the key characteristics of the observed data.
+
+4.  Forecasting: generate future values of the time series based on the posterior distribution of the parameters. Use the posterior samples to simulate future values and obtain a distribution of forecasted values at each future time point.
+
+5.  Model Comparison: compare different models using the Deviance Information Criterion
+
+## Model
+
+An autoregressive model specifies that the output variable depends linearly on its own previous values and on a stochastic term. An $AR(p)$ process can be modeled as $$Y_t = \alpha + \sum_{i=1}^p \phi_i Y_{t-i} + \epsilon_t$$
+
+where
+
+-   $\alpha$ is a constant (the overall mean parameter). It represents the baseline level of the time series when all lagged terms are zero.
+
+-   $\phi_i$ are the model autoregression parameters. These coefficients represent the relationship between the current value of the time series and its previous values. They indicate the strength and direction of the influence of past values on the current value. For example, a positive $\phi_1$ means that if the previous value was high, the current value tends to be high as well.
+
+-   $\epsilon_t$ represents the random noise or shocks in the time series. It is usually assumed to be white noise, meaning it has a mean of zero, constant variance and no autocorrelation.
+
+In a Bayesian framework, we need to specify the likelihood function and the prior distributions for these parameters since they are treated as random variables.
+
+For the $AR(p)$ model the likelihood is given by:
+
+$$
+Y_t | \alpha, \phi_1, ..., \phi_p, \sigma^2 ∼ N(\alpha + \sum_{i=1}^p \phi_i Y_{t-i}, \sigma^2)
+$$
+
+While the prior distributions could be chosen based on domain knowledge or common practices. One reasonable choice could be:
+
+-   $\alpha ∼ N (0, 10)$
+
+-   $\phi_t ∼ N(0, \frac{1}{4})$
+
+-   $\sigma ∼ Unif(0, 10)$
+
+since we don't want values too big of $\phi_t$ and the standard deviation must always be positive.
+
+As usual in Bayesian analysis, we will update these priors to posteriors using the likelihood function. To obtain the posterior distributions we will use MCMC, which allow us to sample from the posterior when it is difficult to compute directly.
+
+### Simulated data
+
+Before creating a model for our data, let's simulate two $AR(1)$ processes.
+
+```{r simulation}
+set.seed(123)
+T = 200
+t_seq = 1:T
+sigma = 1
+alpha = 0.5
+
+phi = 0.6
+y_sim = rep(NA,T)
+y_sim[1] = rnorm(1,0,sigma)
+for(t in 2:T) y_sim[t] <- rnorm(1, alpha + phi * y_sim[t-1], sigma)
+
+phi = 1.1
+y_sim_2 = rep(NA,T)
+y_sim_2[1] = rnorm(1,0,sigma)
+for(t in 2:T) y_sim_2[t] <- rnorm(1, alpha + phi * y_sim_2[t-1], sigma)
+```
+
+```{r echo=FALSE}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+
+# Plot the first AR(1) process
+plot(y_sim, type = 'l', col = 'darkturquoise', lwd = 2, 
+     xlab = 'Time', ylab = 'Value', 
+     main = 'AR(1) Process, phi = 0.6')
+grid()
+
+# Plot the second AR(1) process
+plot(y_sim_2, type = 'l', col = 'seagreen', lwd = 2, 
+     xlab = 'Time', ylab = 'Value', 
+     main = 'AR(1) Process, phi = 1.1')
+grid()
+
+# Add an overall title
+mtext("Comparison of AR(1) Processes with Different Phi Values", outer = TRUE, cex =1.5)
+
+```
+
+It is interesting to notice that if $|\phi| > 1$ the process diverges very quickly (it is not stationary). This gives us useful information about the prior distributions of the parameters. More generally, for an $AR(p)$ model to be stationary the roots of a specific polynomial equation involving the model's parameters must all lie outside the unit circle in the complex plane.
+
+Now we will try to recover the model parameters from the first simulated data.
+
+```{r jags sim}
+sim_parameters =  c("alpha","phi","sigma")
+
+sim_data <- list(Y = y_sim, T = length(y_sim), p= 1)
+
+# Run the model
+sim_model <- jags(data = sim_data,
+                     parameters.to.save = sim_parameters,
+                     model.file="model_sim.txt",
+                     n.chains=2,
+                     n.iter=1000,
+                     n.burnin=200,
+                     quiet = TRUE
+                     )
+
+print(sim_model)
+```
+
+Indeed, by looking at the average values for the parameters we obtained, we can see they are close to the true ones. In particular, the true value are inside the $95\%$ credible intervals.
+
+Next, we simulate an $AR(2)$ process and check again the ability of MCMC to recover the parameters from the data.
+
+```{r}
+set.seed(123)
+
+# True parameters
+phi = c(0.4, -0.2)
+sigma = 0.5
+alpha = 0.4
+
+y_sim_3 = rep(NA,T)
+y_sim_3[1:2] = rnorm(2, 0, sigma)
+for(t in 3:T) y_sim_3[t] <- rnorm(1, alpha + phi[1] * y_sim_3[t-1] + phi[2] * y_sim_3[t-2] , sigma)
+
+plot(y_sim_3, type = 'l', main = "Simulated AR(2) Data")
+
+```
+
+```{r}
+p <- 2
+T <- length(y_sim_3)
+
+sim_data <- list(Y = y_sim_3, T = T, p = p)
+
+params <- c("alpha", "phi","sigma")
+
+inits <- list(
+  list(alpha = 1, phi =  c(1, 1), sigma = 0.1), 
+  list(alpha = 0.5, phi = c(0.5, 0.5),  sigma = 0.5),
+  list(alpha = 0, phi = c(1, 0.5),  sigma = 1)
+)
+
+jags_sim <- jags(data=sim_data,
+               inits=inits,
+               model.file="model_ar_v1.txt",
+               parameters.to.save = params,
+               n.chains=3,
+               n.iter=10000,
+               n.burnin=2000,
+               quiet = TRUE)
+
+print(jags_sim)
+
+```
+
+```{r, include=FALSE}
+# Generate posterior predictive samples
+set.seed(123)
+n_samples <- nrow(jags_sim$BUGSoutput$sims.list$alpha)  
+Y_pred <- matrix(NA, nrow = n_samples, ncol = T)
+
+for (i in 1:n_samples) {
+  alpha <- as.numeric(jags_sim$BUGSoutput$sims.list$alpha[i])
+  phi <- as.numeric(jags_sim$BUGSoutput$sims.list$phi[i, ])
+  sigma <- as.numeric(jags_sim$BUGSoutput$sims.list$sigma[i])
+  
+  # Initialize the first two values based on the observed data
+  Y_pred[i, 1:2] <- y_sim_3[1:2]
+  
+  for (t in 3:T) {
+    Y_pred[i, t] <- alpha + phi[1] * Y_pred[i, t-1] + phi[2] * Y_pred[i, t-2] + rnorm(1, 0, sigma)
+  }
+}
+
+# Plot predictive intervals
+pred_mean <- apply(Y_pred, 2, mean)
+pred_lower <- apply(Y_pred, 2, quantile, probs = 0.025)
+pred_upper <- apply(Y_pred, 2, quantile, probs = 0.975)
+
+data_plot <- data.frame(Time = 1:T, Observed = y_sim_3, Predicted = pred_mean, Lower = pred_lower, Upper = pred_upper)
+
+ggplot(data_plot, aes(x = Time)) +
+  geom_line(aes(y = Observed), color = "black") +
+  geom_line(aes(y = Predicted), color = "red") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "blue", alpha = 0.2) +
+  theme_minimal() +
+  ggtitle("Observed vs Predicted with 95% Credible Intervals")
+
+```
+
+Even in this case the true parameters are inside the credible intervals and the estimated parameters are very close to the true ones.
+
+### Real data
+
+Now, we can fit the model to our data. We will use an $AR(2)$ model, since the PACF cuts off at $2$.
+
+Important input parameters to JAGS are:
+
+-   the number of markov chains to produce (`n.chains`), in order to avoid non-ergodic behavior, which can occur if the chain gets stuck and doesn't explore all the possible areas of the parameter space
+
+-   the burn-in iterations (`n.burnin`), to discard the first samples which might be unreliable
+
+```{r real 1}
+l <- 4
+y_tr <- y[c(1:(length(y) - l))]
+y_te <- y[c((length(y) - l + 1):length(y))]
+
+p <- 2
+T <- length(y_tr)
+
+real_data <- list(Y = y_tr, T = T, p = p)
+
+params <- c("alpha", "phi","sigma")
+
+inits <- list(
+  list(alpha = 1, phi =  c(1, 1), sigma = 0.1), 
+  list(alpha = 0.5, phi = c(0.5, 0.5),  sigma = 0.5),
+  list(alpha = 0, phi = c(1, 0.5),  sigma = 1)
+)
+
+jags.1 <- jags(data=real_data,
+               inits=inits,
+               model.file="model_ar_v1.txt",
+               parameters.to.save = params,
+               n.chains=3,
+               n.iter=10000,
+               n.burnin=2000,
+               quiet = TRUE)
+
+print(jags.1)
+```
+
+## Diagnostics and Convergence
+
+First of all we check if the MCMC have converged.
+
+### 1. Overall Convergence of the Empirical Distribution
+
+To understand this we can start by looking at the **Gelman-Rubin Diagnostic (R-hat)**, that compares the variance between multiple chains to the variance within each chain . R-hat values close to one generally indicate that the chains have converged. In our case all values are below this threshold. We can also look at the evolution of Gelman-Rubin's shrink factor as the number of iterations increases, to really be sure it converges.
+
+```{r gelman, echo=FALSE}
+gelman.plot(as.mcmc(jags.1))
+```
+
+### 2. Stationarity
+
+Next, we look at the **traceplot**, a plot of iterations (x) vs sampled values (y). If the chains show no trend and are well mixed, then it suggest convergence. Indeed, if a traceplot shows no trend it suggests that the chain has reached a stable state where the samples are being drawn from the stationary distribution of the parameter (stationarity implies that the distribution of the chain has converged to the target distribution). Good mixing indicates that the chain is not getting stuck and is exploring effectively the paramete
+
+```{r trace, echo=FALSE}
+plot(as.mcmc(jags.1))
+```
+
+No patterns or irregularities are observed, and therefore we could assume convergence.
+
+### 3. Speed of Exploration of Target Support
+
+We then monitor **autocorrelation** to assess the correlation of the series with its lags. The idea is that rapid decay suggests good mixing and an efficient exploration of the target distribution.
+
+```{r autocorr mcmc, echo=FALSE}
+autocorr.plot(as.mcmc(jags.1))
+```
+
+In our case the autocorrelation immediately falls around zero for the first lag.
+
+### 4. Correlation
+
+Next we look at correlation between parameters. High correlation might suggest dependencies that affect the estimate of the parameters.
+
+```{r corr, echo=FALSE}
+pairs(jags.1$BUGSoutput$sims.matrix[, -2])
+```
+
+There is some correlation between the autoregressive parameters but this shouldn't be an issue and is normal since the lagged terms are not independent of each other, but should still be noted.
+
+### 5. Proximity to i.i.d. simulation
+
+We can look at **Effective Sample Size** to evaluate the sampling efficiency. Higher ESS means that the MCMC are providing more independent information, suggesting that the chain is exploring in more depth the parameter space and thus the estimates are more reliable.
+
+```{r ESS, echo=FALSE}
+effectiveSize(as.mcmc(jags.1))
+
+```
+
+Our ESS is close to the true sample size, which further suggests our chain has converged.
+
+### 6. Convergence of each individual empirical mean
+
+We can then examine the **Monte Carlo Standard Error**, an estimate of the inaccuracy of Monte Carlo samples regarding the expectation of posterior samples. It is essentially a standard deviation around the posterior mean of the samples. In other words, they measure the variation of the mean of the parameter of interest due to the simulation. If they are low compared to the corresponding estimated standard deviation, then the posterior mean was estimated with high precision. This is our case.
+
+```{r, echo=FALSE}
+# Extract the posterior samples for each parameter
+alpha_samples <- jags.1$BUGSoutput$sims.list$alpha
+phi1_samples <- jags.1$BUGSoutput$sims.list$phi[,1]
+phi2_samples <- jags.1$BUGSoutput$sims.list$phi[, 2]
+sigma_samples <- jags.1$BUGSoutput$sims.list$sigma
+
+# Calculate the MCSE for each parameter
+mcse_alpha <- LaplacesDemon::MCSE(alpha_samples)
+mcse_phi1 <- LaplacesDemon::MCSE(phi1_samples)
+mcse_phi2 <- LaplacesDemon::MCSE(phi2_samples)
+mcse_sigma <- LaplacesDemon::MCSE(sigma_samples)
+
+# Calculate the standard deviation for each parameter
+sd_alpha <- sd(alpha_samples)
+sd_phi1 <- sd(phi1_samples)
+sd_phi2 <- sd(phi2_samples)
+sd_sigma <- sd(sigma_samples)
+
+results <- data.frame(
+  Parameter = c("alpha", "phi[1]", "phi[2]", "sigma"),
+  MCSE = c(mcse_alpha, mcse_phi1, mcse_phi2, mcse_sigma),
+  SD = c(sd_alpha, sd_phi1, sd_phi2, sd_sigma)
+)
+
+print(results)
+
+```
+
+### ggmcmc
+
+Finally using `ggmcmc` we can look at a collection of model diagnostics in a single pdf file.
+
+```{r}
+S <- ggs(as.mcmc(jags.1))
+ggmcmc(S)
+```
+
+## Inferential Findings
+
+Let's examine the values of the parameters are inside the unit circle
+
+```{r}
+plot(jags.1$BUGSoutput$sims.array[, 1,3:4])
+```
+
+### **Point and Interval Estimation**
+
+We can easily access the posterior mean and median of the parameters. Moreover, we can also look at the values for the $95\%$ credible intervals.
+
+```{r point est, echo=FALSE}
+print(jags.1$BUGSoutput$summary)
+```
+
+We can then build credible intervals like this:
+
+```{r cred 80}
+ci_phi1_95 <- quantile(phi1_samples, c(0.025, 0.975))
+ci_phi2_95 <- quantile(phi2_samples, c(0.025, 0.975))
+ci_alpha_95 <- quantile(alpha_samples, c(0.025, 0.975))
+ci_sigma_95 <- quantile(sigma_samples, c(0.025, 0.975))
+
+# Print credible interval
+cat("95% credible interval for phi[1]: ", ci_phi1_95, "\n",
+    "95% credible interval for phi[2]: ", ci_phi2_95, "\n",
+    "95% credible interval for alpha: ", ci_alpha_95, "\n",
+    "95% credible interval for sigma: ", ci_sigma_95, "\n")
+
+```
+
+We can also compute the Highest Posterior Density intervals:
+
+```{r}
+phi1_mcmc <- as.mcmc(phi1_samples)
+phi2_mcmc <- as.mcmc(phi2_samples)
+alpha_mcmc <- as.mcmc(alpha_samples)
+sigma_mcmc <- as.mcmc(sigma_samples)
+
+# Calculate HPD intervals
+hpd_phi1 <- HPDinterval(phi1_mcmc, prob = 0.95)
+hpd_phi2 <- HPDinterval(phi2_mcmc, prob = 0.95)
+hpd_alpha <- HPDinterval(alpha_mcmc, prob = 0.95)
+hpd_sigma <- HPDinterval(sigma_mcmc, prob = 0.95)
+
+# Print HPD intervals
+cat("95% HPD interval for phi[1]: ", hpd_phi1, "\n",
+    "95% HPD interval for phi[2]: ", hpd_phi2, "\n",
+    "95% HPD interval for alpha: ", hpd_alpha, "\n",
+    "95% HPD interval for sigma: ", hpd_sigma, "\n")
+```
+
+We then plot the credible intervals to gain a better understanding:
+
+```{r}
+mcmc_areas(jags.1$BUGSoutput$sims.matrix, pars = c("phi[1]" ,"phi[2]", "alpha"), prob = 0.95, point_est = c("mean"))
+```
+
+It can also be useful to look at the posterior distributions of the parameters to get a complete picture of the uncertainty associated with each parameter.
+
+```{r post_distro, echo=FALSE}
+densityplot(as.mcmc(jags.1))
+```
+
+### Hypothesis testing
+
+We can now even perform hypothesis testing for the parameters using the credible intervals and the samples from the posterior distribution. In particular we just have to check if the point null hypothesis $\theta_0$ is inside the $0.95$ credible interval we computed before. If it is inside then decide in favor of $H_0$, otherwise reject it.
+
+```{r}
+null_value <- 0
+
+if (null_value >= ci_phi1_95[1] && null_value <= ci_phi1_95[2]) {
+  cat("Null hypothesis cannot be rejected.\n")
+} else {
+  cat("Null hypothesis is rejected.\n")
+}
+```
+
+By looking at the distributions and the interval estimates we can conclude that all parameters are significantly different from zero. Moreover, we understand that the first lag has a stronger inlfuence than the second lag, with around $60\%$ of the value of $Y_{t-1}$ carried forward to $Y_t$, while only $30\%$ of $Y_{t-2}$.
+
+This implies that the time series has short-term memory, with past values influencing future values but diminishing over time.
+
+## Model comparisons
+
+If, instead, we were to use a classical / frequentist AR model, we would only get point estimates for the parameters, while as we have seen the Bayesian way provides posterior distributions for parameters, reflecting the uncertainty about their values.
+
+Indeed, we show this difference by training a frequentist AR model and then comparing the results of the parameters estimates with the Bayesian approach.
+
+```{r}
+ar_f <- ar(y_tr, aic = FALSE, order.max = 2)
+```
+
+```{r, echo=FALSE}
+par(mfrow = c(1, 2))
+# Plot histogram for phi[1]
+hist(phi1_samples, breaks = 20, col = "lightblue", border = "white",
+     main = "Posterior Distribution of phi[1]", xlab = "phi[1]")
+abline(v = ar_f$ar[1], col = "red", lwd = 2)
+abline(v = mean(phi1_samples), col = "blue3", lwd = 2, lty =2)
+legend("topright", legend = c(paste("Frequentist estimate:", round(ar_f$ar[1], 2)), 
+                              paste("Bayesian mean:", round(mean(phi1_samples), 2))), 
+       col = c("red", "blue3"), lty = 1:2, cex = 0.8, bty = "n")
+
+# Plot histogram for phi[2]
+hist(phi2_samples, breaks = 20, col = "lightblue", border = "white",
+     main = "Posterior Distribution of phi[2]", xlab = "phi[2]")
+abline(v = ar_f$ar[2], col = "red", lwd = 2)
+abline(v = mean(phi2_samples), col = "blue3", lwd = 2, lty = 2)
+legend("topright", legend = c(paste("Frequentist estimate:", round(ar_f$ar[2], 2)), 
+                              paste("Bayesian mean:", round(mean(phi2_samples), 2))), 
+       col = c("red", "blue3"), lty = 1:2, cex = 0.8, bty = "n")
+```
+
+We notice that the mean of the posterior distribution of the coefficients is very close to the frequentist estimate.
+
+Is the $AR(2)$ model really the best choice as suggested by PACF plot ? To be sure we can try to use an $AR(3)$ model and then compare the DIC to see which model is better. The one with the lowest DIC will be the one we should choose.
+
+```{r}
+real_data <- list(Y = y_tr, T = T, p = 3)
+
+inits <- list(
+  list(alpha = 1, phi =  c(1, 1, 1), sigma = 0.1), 
+  list(alpha = 0.5, phi = c(0.5, 0.5, 0.5),  sigma = 0.5),
+  list(alpha = 0, phi = c(1, 0.5, 1),  sigma = 1)
+)
+
+jags.2 <- jags(data=real_data,
+               inits=inits,
+               model.file="model_ar_v2.txt",
+               parameters.to.save = params,
+               n.chains=3,
+               n.iter=10000,
+               n.burnin=2000,
+               quiet = TRUE)
+
+print(jags.2)
+print(jags.1$BUGSoutput$DIC)
+```
+
+Indeed, the DIC is higher for the $AR(3)$ model which means the $AR(2)$ should be preferred.
+
+DIC stands for **Deviance Information Criterion** and is a measure used for model selection and comparison. It balances the fit of the model (captured by the deviance) with its complexity captured by the effective number of parameters).
+
+It is computed as
+
+$$
+DIC = D(\bar\theta) + 2 \cdot p_D
+$$
+
+The deviance is a measure of goodness of fit of the model to the data. It is defined as:
+
+$$
+D(\theta) = -2\log(p(y|\theta)) + C
+$$
+
+where $p(y|\theta)$ is the likelihood function. The lower the deviance, the better the fit.
+
+The effective number of parameters $p_D = \frac{1}{2}Var[D(\theta)]$ accounts for the complexity of the model. The larger it is, the easier it is for the model to fit (possibly overfit) the data.
+
+## Model Checking and Posterior Predictive Distribution
+
+To assess the adequacy of the chosen model in capturing the patterns and variability present in the observed data we will run a posterior predictive check.
+
+Sampling parameters from the posterior distributions and using them to generate possible paths of the time series, it is possible to create a distribution of outcomes. This allows us to account for parameter uncertainty. Formally, the posterior predictive distribution for a new observation $y_{new}$ given the observed data $y$ is defined as:
+
+$$ P(y_{new} | y) = \int P(y_{new} | \theta) P(\theta | y) d\theta $$
+
+This integral is approximated by using MCMC samples from the posterior distribution.
+
+### In-Sample
+
+```{r}
+n_sim <- jags.1$BUGSoutput$n.sims
+n_obs <- length(y_tr)
+
+# Initialize matrix for simulated data
+Y_sim <- matrix(NA, nrow = n_sim, ncol = n_obs)
+resid_sim <- matrix(NA, nrow = n_sim, ncol = n_obs)
+
+# Simulate new data
+for (i in 1:n_sim) {
+  alpha <- alpha_samples[i]
+  phi1 <- phi1_samples[i]
+  phi2 <- phi2_samples[i]
+  sigma <- sigma_samples[i]
+  
+  Y_sim[i, 1:2] <- y_tr[1:2]
+  resid_sim[i, 1:2] <- c(0, 0)
+  for (t in 3:n_obs) {
+    Y_sim[i, t] <- alpha + phi1 * Y_sim[i, t-1] + phi2 * Y_sim[i, t-2] + rnorm(1, 0, sigma)
+    resid_sim[i, t] <- y_tr[t] - Y_sim[i, t]
+  }
+}
+```
+
+```{r, echo=FALSE}
+
+# Calculate mean and quantiles for simulated data
+Y_sim_mean <- apply(Y_sim, 2, mean)
+Y_sim_low <- apply(Y_sim, 2, quantile, probs = 0.025)
+Y_sim_high <- apply(Y_sim, 2, quantile, probs = 0.975)
+
+# Plot the observed data and the posterior predictive checks
+plot(y_tr, type = "l", col = "black", main = "Posterior Predictive Check", xlab = "Time", ylab = "Value")
+
+# Plot individual simulated lines 
+for (i in 1:50) {
+  lines(Y_sim[i,], col = alpha("aquamarine3", 0.5), lwd = 0.5)
+}
+
+lines(y_tr, type = "l", col = "black", lwd = 2)
+
+# Plot mean of simulated data
+lines(Y_sim_mean, col = "red3", lwd = 2)
+
+# Plot 95% credible intervals
+lines(Y_sim_low, col = "blue4", lty = 2)
+lines(Y_sim_high, col = "blue4", lty = 2)
+
+
+legend("topright", legend = c("Observed Data", "Predictive Mean", "95% CI", "Individual Simulations"),
+       col = c("black", "red3", "blue4", alpha("aquamarine3", 0.3)), lty = c(1, 1, 2, 1))
+
+
+grid()
+
+```
+
+```{r, echo=FALSE}
+
+par(mfrow = c(1, 2), mar = c(5, 4, 4, 2) + 0.1)
+
+# Histogram of Residuals
+hist(resid_sim, main = "Histogram of Residuals", xlab = "Residuals", col = "lightblue", border = "white", breaks = 50)
+abline(v = 0, col = "red", lwd = 2) 
+box() 
+
+# Line Plot of Residuals
+matplot(resid_sim[1:50,], type = 'p', pch = 1,  xlab = "Simulation", ylab = "Residuals",
+        main = "Plot of Residuals")
+abline(h = 0, col = 'red', lwd = 2)
+
+```
+
+### Out-of-Sample
+
+#### Multiple steps ahead forecasting
+
+We can generate forecasts for multiple future time steps by iteratively using the posterior samples of the model parameters.
+
+```{r forecast}
+# Number of future time steps to forecast
+forecast_steps <- l
+
+total_samples <- jags.1$BUGSoutput$n.sims
+n_samples_to_use <- 2000
+
+# Randomly select a subset of samples
+set.seed(123)
+subset_indices <- sample(1:total_samples, n_samples_to_use)
+
+# Initialize a matrix to store forecast values
+forecast_values <- matrix(NA_real_, nrow = forecast_steps + 2, ncol = n_samples_to_use)
+forecast_values[1, ] = y_tr[length(y_tr) - 1]
+forecast_values[2, ] = y_tr[length(y_tr)]
+
+residuals <- matrix(NA, nrow = forecast_steps + 2, ncol = n_samples_to_use)
+
+# Generate forecast values for each posterior sample
+for (s in 1:n_samples_to_use) {
+  alpha <- alpha_samples[s]
+  phi1 <- phi1_samples[s]
+  phi2 <- phi2_samples[s]
+  sigma <- sigma_samples[s]
+  
+  for (row in (p+1):(forecast_steps + 2)) {
+    noise <- rnorm(1, 0, sigma) 
+    forecast_values[row, s] <- alpha + phi1 * forecast_values[row - 1, s] + phi2 * forecast_values[row - 2, s] + noise
+    residuals[row, s] <- y_te[row-2] - forecast_values[row, s]
+  }
+}
+
+#Median and mean
+median_forecast <- apply(forecast_values, 1, median)
+mean_forecast <- apply(forecast_values, 1, mean)
+
+# Credible interval
+lower_quantile <- apply(forecast_values[2:(forecast_steps + 2), ], 1, quantile, probs = 0.025)
+upper_quantile <- apply(forecast_values[2:(forecast_steps + 2), ], 1, quantile, probs = 0.975)
+```
+
+```{r fore plots, echo=FALSE}
+# Plotting the forecast distribution
+par(mfrow = c(1, 1))
+plot(y_tr, type = 'l', xlim = c(round(length(y_tr)*0.9), length(y_tr) + forecast_steps), ylim = range(y_tr, forecast_values, na.rm = TRUE), main = "Time Series Forecast", xlab = "Time", ylab = "Value")
+
+ts_fcst <- T:(T+forecast_steps)
+for (s in 1:ncol(forecast_values)) {
+  lines(ts_fcst, forecast_values[2:(forecast_steps + 2), s], col = rgb(0, 1, 0, 0.1), lwd = 0.5)
+}
+
+# Add median and mean forecast line
+lines(ts_fcst, median_forecast[2:length(median_forecast)], col = "red3", lwd = 2)
+lines(ts_fcst, mean_forecast[2:length(mean_forecast)], col = "blue2", lwd = 2)
+
+# Add 95% credible interval
+lines(ts_fcst, lower_quantile, col = "purple2", lwd = 1, lty = 4)
+lines(ts_fcst, upper_quantile, col = "purple2", lwd = 1, lty = 4)
+
+#Add observed data points for context
+lines(c(length(y_tr):(length(y_tr) + forecast_steps)), c(y_tr[length(y_tr)], y_te), col = "black", lty = 4, lwd = 2)
+legend("topleft", legend = c("Observed", "Forecast Paths", "Median Forecast", "Mean Forecast", "95% CI"), col = c("black", rgb(0, 1, 0, 0.5), "red3", "blue2", "purple2"), lty = c(4, 1, 1, 1, 3), lwd = c(1, 0.5, 2, 2, 1))
+grid()
+```
+
+At each forecast step we don't get a single value, but a distribution of possible outcomes.
+
+```{r, echo=FALSE}
+# Posterior distributions for each forecast step
+par(mfrow = c(2, 2))
+for (i in 1:forecast_steps) {
+  hist(forecast_values[i + 2, ], breaks = 30, main = paste("PPD - Forecast ", i), xlab = "Value", probability = TRUE, col = "pink4")
+  lines(density(forecast_values[i + 2, ]), col = "slateblue3", lwd = 2)
+  abline(v=y_te[i], col = 'red4', lwd = 2)
+}
+
+```
+
+We can also compute the residuals and check for structural assumptions using appropriate tests and plots.
+
+```{r residuals-plots, echo=FALSE}
+par(mfrow = c(1, 1))
+
+hist(as.vector(residuals[3:6,]), main = "Histogram of Residuals", xlab = "Residuals", col = "lightblue", border = "white")
+
+
+par(mfrow = c(2, 2))
+
+# Plot residuals for specific observations
+plot(residuals[3,], type = "o", main = "Residuals for Forecast 1", xlab = "Time", ylab = "Residuals", col = "blue")
+abline(h = 0, col = "red")
+
+plot(residuals[4,], type = "o", main = "Residuals for Forecast 2", xlab = "Time", ylab = "Residuals", col = "blue")
+abline(h = 0, col = "red")
+
+plot(residuals[5,], type = "o", main = "Residuals for Forecast 3", xlab = "Time", ylab = "Residuals", col = "blue")
+abline(h = 0, col = "red")
+
+plot(residuals[6,], type = "o", main = "Residuals for Forecast 4", xlab = "Time", ylab = "Residuals", col = "blue")
+abline(h = 0, col = "red")
+
+# Perform Shapiro-Wilk test for normality on residuals of observation 3
+shapiro_result <- shapiro.test(residuals[3,])
+cat("Shapiro-Wilk normality test for residuals of forecast 1:\n")
+print(shapiro_result)
+```
+
+If we want to make a forecast we can take, for example, the mean of the distribution of forecasts at each step and use this as the forecast for that step. If we do this we will notice we get values very close to the ones we would obtain with a frequentist $AR(2)$ model.
+
+```{r bayes vs freq, echo=FALSE}
+preds <- predict(ar_f, n.ahead = l)
+md <- arima(y_tr, c(2, 1, 5))
+preds <- predict(md, n.ahead = l)
+
+# Plot actual vs predicted values
+plot(y_te, type = 'l', col = 'black', lwd = 2, 
+     xlab = 'Test index', ylab = 'Value', 
+     main = 'Comparison of AR Model Predictions', 
+     ylim = range(c(y_te, preds$pred, mean_forecast[3:length(mean_forecast)])))
+
+# Add Frequentist AR predictions
+lines(as.vector(preds$pred), col = 'red', lwd = 2)
+
+# Add Bayesian AR predictions
+lines(mean_forecast[3:length(mean_forecast)], col = 'blue', lwd = 2)
+
+
+legend("topright", legend = c("Actual", "Frequentist AR", "Bayesian AR"), 
+       col = c("black", "red", "blue"), lwd = 2, lty = 1)
+
+grid()
+
+```
+
+We can check the overall goodness of forecast and compare it to that of a frequentist approach.
+
+```{r, echo=FALSE}
+freq_acc <- forecast::accuracy(y_te, preds$pred)
+bayes_acc <- forecast::accuracy(y_te, mean_forecast[3:length(mean_forecast)])
+
+cat("Frequentist AR Model RMSE and MAPE:", freq_acc[c(2,5)],
+    "\nBayesian AR Model RMSE and MAPE:", bayes_acc[c(2, 5)])
+
+```
+
+##### Forecasting using MCMC
+
+If we set some of the values in our data list to the value *"NA"* JAGS will treat these missing data as additional parameters to be estimated. This is especially useful for time series as we can create extra values at the end of our series, and JAGS will magically turn these into future forecasts. We are essentially estimating the joint posterior predictive distribution for future/missing observations using MCMC.
+
+```{r}
+n_forecasts <- l
+
+p <- 2
+T <- length(y_tr) + n_forecasts
+
+real_data <- list(Y = c(y_tr, rep(NA, n_forecasts)),
+                  T = T, p = p)
+
+params <- c("Y")
+
+
+jags_fore <- jags(data=real_data,
+               model.file="model_ar_v1.txt",
+               parameters.to.save = params,
+               n.chains=3,
+               n.iter=10000,
+               n.burnin=2000,
+               quiet = TRUE)
+
+y_all <- jags_fore$BUGSoutput$sims.list$Y
+```
+
+```{r, echo=FALSE}
+# Calculate means and quantiles
+y_all_mean <- apply(y_all, 2, mean)
+y_all_low <- apply(y_all, 2, quantile, probs = 0.025)
+y_all_high <- apply(y_all, 2, quantile, probs = 0.975)
+
+indices <- 240:262
+
+# Set up the plot
+plot(indices, y_all_mean[indices], type = 'l', ylim = range(c(y_all_low, y_all_high)), 
+     xlab = "Time", ylab = "Value", main = "Posterior Predictive Check",
+     col = "red4", lwd = 2)
+
+# Add uncertainty bands
+lines(indices, y_all_low[indices], col = 'slateblue3', lty = 'dotted')
+lines(indices, y_all_high[indices], col = 'slateblue3', lty = 'dotted')
+
+points((length(y) - l + 1):length(y), y_te, pch = 16, col = 'black')
+
+grid()
+
+```
+
+If we want to go back to the original scale we can simply apply the Inverse Box-Cox transform to our predictions and add back the trend and the seasonality.
+
+```{r reconstruct}
+inv_b <- forecast::InvBoxCox(y_all_mean[(length(y) - l -1):length(y)], lambda = lambda)
+inv_b <- inv_b + as.vector(decomp$seasonal)[(length(y) - l - 1):length(y)] + as.vector(na.approx(decomp$trend, rule = 2))[(length(y) - l - 1):length(y)]
+inv_fr <- forecast::InvBoxCox(preds$pred, lambda) 
+inv_fr <- inv_fr + as.vector(decomp$seasonal)[(length(y) - l + 1):length(y)] + as.vector(na.approx(decomp$trend, rule = 2))[(length(y) - l + 1):length(y)]
+```
+
+```{r rec plot, echo=FALSE}
+plot(as.vector(data_ts) + as.vector(decomp$seasonal) + as.vector(na.approx(decomp$trend, rule = 2)), type = 'l', xlim = c(220, length(y)), main = "Original vs Reconstructed Time Series", lwd = 2)
+lines(c((length(y_tr)):(length(y_tr) + forecast_steps)), inv_b[2:length(inv_b)], col = 'blue', lwd = 2)
+lines(c((length(y_tr) + 1):(length(y_tr) + forecast_steps)), inv_fr, col = 'red')
+legend("topleft", legend = c("Original", "Reconstructed - Bayesian", "Reconstructed - Frequentist"), col = c("black", "blue", "red"), lwd = 2)
+abline(v=length(y_tr), lty = 2, lwd = 0.5)
+
+```
+
+#### One-step-ahead Forecasts
+
+We can also make predictions one step ahead using as coefficients the posterior mean of the parameters.
+
+```{r ons step, warning=FALSE}
+alpha_m <- jags.1$BUGSoutput$mean$alpha
+phi1_m <- jags.1$BUGSoutput$mean$phi[1]
+phi2_m <- jags.1$BUGSoutput$mean$phi[2]
+
+t2 <- c(NA, y[1:(length(y)-2)])
+fitted_values <- alpha_m + phi1_m * y[1:(length(y)-1)] + phi2_m * t2
+
+
+# Plot actual vs fitted values
+plot(as.vector(y), type='l', main = "One-step-ahead Forecast", 
+     xlab = 'Time', ylab = 'Value', col = 'black', lwd = 2)
+
+# Add fitted values
+lines(2:length(y), fitted_values, col = 'red', lwd = 1.5)
+
+legend("topright", legend = c("Actual", "Forecast"), 
+       col = c("black", "red"), lwd = 2, lty = 1, cex = 1.2)
+
+grid()
+```
