@@ -12,4 +12,5 @@ goals of the analysis
 - discussion of one possible alternative statistical model and showcase of the results of model comparison through DIC
 - illustration of the features of the MCMC convergence diagnostics and error control
 
+Link to the report: https://rawcdn.githack.com/bergio13/bayesian_inference_mcmc/d070625cea8e6650dee232aaf4cb2a3a1a9b701f/final_proj_2.html
 
